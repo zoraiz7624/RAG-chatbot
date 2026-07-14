@@ -1,0 +1,26 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+pymongo
+requests
+python-dotenv
+
+# RAG stack
+langchain-community
+langchain-text-splitters
+langchain-openai
+langchain-core
+langchain-classic
+faiss-cpu
+sentence-transformers
+
+# Voice
+faster-whisper
+pyttsx3
+
+# Face recognition login
+opencv-python-headless
+numpy
+insightface
+onnxruntime
