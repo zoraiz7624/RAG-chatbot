@@ -1,289 +1,404 @@
-import os
-import uuid #every chat session needs its own unique ID
-import requests#this library sends HTTP requests
-from fastapi import FastAPI, HTTPException, status #Instead of crashingyou send proper errors
-from pydantic import BaseModel#Pydantic validates incoming data from frontend before my function runs
+from fastapi  import FastAPI ,UploadFile, File
+from pydantic import BaseModel
 from pymongo import MongoClient
-from fastapi.middleware.cors import CORSMiddleware#Since Streamlit and FastAPI run on different ports, the browser blocks communication unless CORS is enabled
+from fastapi.middleware.cors import CORSMiddleware
+import requests
+import uuid
+import os
 from dotenv import load_dotenv
-import numpy as np
-import cv2#processes images
-from fastapi import APIRouter, HTTPException, UploadFile, File #UploadFile Allows frontend to send photo.jpg to backend
-from login import get_face_embedding, verify_embedding
-from jose import jwt, JWTError #creates and verifies JWT tokens
-from datetime import datetime, timedelta #datetime gets current time and timedelta sets an expiration time
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi import Depends
+import os
+import shutil
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-router = APIRouter(prefix="/auth", tags=["Face Authentication"]) #FastAPI lets us group related endpoints together using an APIRouter
-                                                                 #tags is just a label that keeps the documentation organized
+from langchain_community.embeddings import HuggingFaceEmbeddings
 
-# initialize environment variables
+from langchain_community.vectorstores import FAISS
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_classic.chains import create_retrieval_chain
+
+from langchain_core.output_parsers import StrOutputParser
+from faster_whisper import WhisperModel
+import tempfile
+from fastapi.staticfiles import StaticFiles
+
+from fastapi import Request, Response
+import auth
+
+app = FastAPI()
+
+os.makedirs("replies", exist_ok=True)
+app.mount("/replies", StaticFiles(directory="replies"), name="replies")
 load_dotenv()
+
+#pip install sentence-transformersGrab the hidden variables using os.getenv
 MONGO_URI = os.getenv("MONGO_URI")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL_NAME = os.getenv("MODEL_NAME")
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
-JWT_ALGORITHM = os.getenv("JWT_ALGORITHM")
-JWT_ACCESS_TOKEN_EXPIRE_MINUTES = int(
-    os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES")
-)
-
-app = FastAPI(title="Secure AI Chatbot Backend")
-
-# setup CORS Policy - security configuration
+API_KEY = os.getenv("OPENAI_API_KEY")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], #allow requests from any website
-    allow_credentials=True, #allows cookies or login credentials to be sent
-    allow_methods=["*"], #allow every HTTP method
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 3. Setup Safe Database Connection
-client = MongoClient(MONGO_URI)
-db = client["chatbot_db"] #MongoDB server can contain many databases
-collection = db["chat_history"] #inside one database, MongoDB stores collections
-                                #every endpoint reuses this same collection object instead of reconnecting to the database
+
+
+clinet=MongoClient(MONGO_URI)
+db=clinet["chatbot_db"]
+collection = db["chat_history"]
+
 users_collection = db["users"]
+sessions_collection = db["sessions"]
+os.makedirs("face_uploads", exist_ok=True)
 
-class ChatMessagePayload(BaseModel): #this class represents incoming request data
-    session_id: str 
-    message: str
+#GET
+# -------server start here
+@app.get("/")
+async def root():
+    return {"status": "Server is running! Go to /docs to test your API."}
 
-
-
-def create_access_token(data: dict): #Generates a signed JWT access token
-
-    payload = data.copy()
-
-    expire = datetime.utcnow() + timedelta( #calculates when the token should expire
-        minutes=JWT_ACCESS_TOKEN_EXPIRE_MINUTES
-    )
-
-    payload.update({"exp": expire})
-
-    token = jwt.encode( #generates jwt token, server signs is using secret key
-        payload,
-        JWT_SECRET_KEY,
-        algorithm=JWT_ALGORITHM
-    )
-
-    return token
+# -------server ends here
+@app.get("/session")
+async def get_chat_history(username: str | None = None):
+     hist = collection.find({"username": username}, {"_id": 0, "session_id": 1})
+     return [i["session_id"] for i in hist]
 
 
-security = HTTPBearer()
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
+@app.post("/session")
+async def session(username: str | None = None):
+     session_id = str(uuid.uuid4())
+     collection.insert_one({
+          "session_id": session_id,
+          "username": username,
+          "message":
+            [{"role": "system", "content": "You are a helpful AI assistant."}]
+     })
+     print("Created session:", session_id, "for", username)
+     return {"session_id": session_id, "username": username}
 
-    try:
-        payload = jwt.decode( #backend extracts jwt token
-            token,
-            JWT_SECRET_KEY, #verifies signature using secret key and checks whether token has expired
-            algorithms=[JWT_ALGORITHM]
-        )
 
-        username = payload.get("sub") #reads username
+# -------get_his start here return the list of sessions
 
-        if username is None:
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid token"
-            )
+@app.get("/history/{session_id}")
+async def get_his(session_id: str, username: str | None = None):
+     doc = collection.find_one({"session_id": session_id}, {"_id": 0})
+     if not doc:
+         return {"error": "Session not found"}
 
-        return username
+     if doc.get("username") and doc["username"] != username:
+         return {"error": "Not your session"}
 
-    except JWTError:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or expired token"
-        )
+     return doc["message"]
 
-# Helper Function for OpenRouter
-async def get_chatbot_reply( username: str,session_id: str, message_text: str):
-    doc = collection.find_one({ #load previous chat whose session_id matches the one I received
-        "session_id": session_id,
-        "username": username
-    })
-    hist = doc.get("message", []) if doc else [] #getting the document itself and storing in hist array
 
-    hist.append({ #newest user message stored
+
+# -------get_his start here return the list of sessions
+
+
+class RegisterBody(BaseModel):
+    username: str
+    password: str
+
+
+class LoginBody(BaseModel):
+    username: str
+    password: str
+
+#------------------------------------POST
+
+#---------------------------------session id is given here plus the new system setting every
+#time a new chat is started this run
+
+
+
+
+#---------------------session id ends here
+
+#--------------------------chat bot starts here
+
+
+class reply(BaseModel):
+    session_id:str 
+    message:str
+
+async def get_chatbot_reply(session_id:str, message: str):
+    doc=collection.find_one({"session_id":session_id})
+    print(doc)
+    if doc:
+      hist=doc["message"]
+    else:
+         hist=[]
+
+    hist.append({
         "role": "user",
-        "content": message_text
+        "content": message
     })
-    
+    OPENROUTER_API_KEY = API_KEY  
+    MODEL_NAME = "tencent/hy3:free"
     URL = "https://openrouter.ai/api/v1/chat/completions"
-    
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}", #This proves I have permission to use OpenRouter
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json"
     }
-    data = { # actual request body
+    data = {
         "model": MODEL_NAME,
         "messages": hist
     }
-    
-    try:
-        response = requests.post(url=URL, headers=headers, json=data) #sending request
-        if response.status_code == 200:#success
+    response = requests.post(
+            url=URL,
+            headers=headers,
+            json=data
+        )
+       
+    if response.status_code == 200:
             ai_reply = response.json()['choices'][0]['message']['content']
-            hist.append({ #AI's answer is also added to the conversation
+            hist.append({
                 "role": "assistant",
                 "content": ai_reply
             })
-            collection.update_one( #this updates MongoDtB
-                {"session_id": session_id},
-                {"$set": {"message": hist}} #replace the old message list with the updated one
-            )
+            collection.update_one({"session_id":session_id},
+                                   {"$set":{"message":hist}}
+                                   )
             return ai_reply
-        else:
+    else:
             return f"Error from OpenRouter (Status {response.status_code}): {response.text}"
-    except Exception as e:
-        return f"AI Generation Fail: {str(e)}"
 
-# HTTP API Endpoints
-@app.get("/")
-async def root():
-    return {"status": "Server is running smoothly!"}
+async def rag(input:str):
+     vector_db=FAISS.load_local("vector_db",HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2"),allow_dangerous_deserialization=True)
+     context =vector_db.as_retriever(search_kwargs={"k":5})
+     
+     llm=ChatOpenAI(model="tencent/hy3:free",api_key=API_KEY,base_url="https://openrouter.ai/api/v1")
+     promt=ChatPromptTemplate.from_template("""
+     You are a helpful AI assistant.
 
-@app.get("/history/{session_id}") #Switching/Loading a Past Chat Session
-async def get_his(
-    session_id: str,
-    username: str = Depends(verify_token)
-):
-    doc = collection.find_one(
-        {
-            "session_id": session_id,
-            "username": username
-        },
-        {"_id": 0}
-    )
-    if not doc:
-        raise HTTPException(status_code=404, detail="Session not found.")
-    return doc.get("message", [])
+    Use ONLY the information provided in the context below to answer the user's question.
 
-@app.get("/session") #Fetching Past Sidebar History Lists
-async def get_chat_history(
-    username: str = Depends(verify_token) #only authenticated users view the session list
-):
-    hist = collection.find({"username": username}, {"_id": 0, "session_id": 1}) #Find every document, but only return session id and a user only gets their own session IDs
-    return [i["session_id"] for i in hist if "session_id" in i]
+    If the answer cannot be found in the context, reply:
+    "I couldn't find the answer in the provided documents."
 
-@app.post("/session", status_code=status.HTTP_201_CREATED) # starting a new chat
-async def create_session(
-    username: str = Depends(verify_token)
-):
-    session_id = str(uuid.uuid4())
-    collection.insert_one({ #creates a new MongoDB document
-        "username": username,
-        "session_id": session_id,
-        "message": [
-            {
-                "role": "system",
-                "content": "You are a helpful AI assistant. Remember everything the user tells you."
-            }
-        ]
-    })
-    return {"session_id": session_id}
+    Keep your answer clear, concise, and accurate.
 
-@app.post("/message") #endpoint your Streamlit app calls every time you press Send
-async def getreply(
-    m: ChatMessagePayload,
-    username: str = Depends(verify_token) #Before running this endpoint, first verify the JWT
-):
-    y = await get_chatbot_reply(username,m.session_id, m.message)
-    return {"e": y} #sends ai response back to the frontend
+    Context:
+    {context}
 
+    Question:
+    {input}
 
+    Answer:
+    """)
+     qc=create_stuff_documents_chain(llm,promt)
+     rag=create_retrieval_chain(context ,qc)
+     res=rag.invoke({"input":input})
+     
+     return res["answer"]
+     
 
+router_llm = ChatOpenAI(
+    model="tencent/hy3:free",
+    api_key=API_KEY,
+    base_url="https://openrouter.ai/api/v1"
+)
 
+router_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a routing classifier for a chatbot with access to uploaded documents.\n"
+     "Decide if the user's message needs to look something up in those documents.\n\n"
+     "Reply with EXACTLY one word, nothing else: rag or chat\n\n"
+     "- rag: the user is asking about specific facts, data, or content that would "
+     "live in an uploaded document (reports, policies, named details, 'what does the doc say about...').\n"
+     "- chat: greetings, small talk, opinions, general knowledge, or anything unrelated to the documents."),
+    ("human", "{question}")
+])
 
+router_chain = router_prompt | router_llm | StrOutputParser()
 
-@router.post("/register-face/{username}")
-async def register_face(username: str, file: UploadFile = File(...)): # 2 things are coming from frontend: username and image captured by the webcam
-    try:
-        print("STEP 1")
-
-        contents = await file.read() #this reads the uploaded file which is in the form of bytes into memory
-        nparr = np.frombuffer(contents, np.uint8) #this converts the uploaded bytes into a NumPy array
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR) #OpenCV converts those bytes into an actual image, frame contains image matrix and size
-
-        embedding = get_face_embedding(frame) # Generate a 512-dimensional AI embedding that uniquely represents this face
-
-        print("STEP 4")
-
-        if embedding is None:
-             raise HTTPException(status_code=400, detail="No face embedding generated.")
-
+async def router(q:str):
+     raw = await router_chain.ainvoke({"question": q})
+     decision = raw.strip().lower()
+     return "rag" if "rag" in decision else "chat"
         
-        embedding_list_for_db = embedding.tolist() #NumPy Array to Python List
-                                                    #MongoDB cannot serialize NumPy arrays, so I convert the face embedding into a regular Python list before storing it
-        print("STEP 5")
 
-        users_collection.update_one(
-            {"username": username},
-            {
-                "$set": {
-                    "username": username,
-                    "face_embedding": embedding_list_for_db
-                }
-            },
-            upsert=True
-       )
 
-        print("STEP 6")
 
-        return {
-            "status": "success",
-            "message": "Registration Complete"
-        }
+@app.post("/message")
+async def getreply(m: reply):
+    decision=await router(m.message)
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        print("ERROR:", e)
-        raise HTTPException(status_code=500, detail=str(e))
+    if decision == "rag":
+        y = await rag(m.message)  
+    else:
+        y = await get_chatbot_reply(m.session_id, m.message)
 
-@router.post("/login-face/{username}")
-async def login_face(username: str, file: UploadFile = File(...)):
-    """Automatically triggered by frontend to verify a user's identity."""
+    return {"e": y, "debug_route": decision}
 
-    user_record = users_collection.find_one({"username": username}) #Go to MongoDB and Find this user
-    if not user_record or "face_embedding" not in user_record:
-        raise HTTPException(status_code=404, detail="User or face profile not found.")
+#--------------------------chat bot end here
+
+#------------------vioce feaature
+
+whisper_model=WhisperModel("base",device="cpu",compute_type="int8")
+@app.post("/voice")
+async def type_the_vioce_promt(f:UploadFile=File(...)):
+     with tempfile.NamedTemporaryFile(suffix=".wav",delete=False) as temp:
+      temp.write(await f.read())
+     seg, _=whisper_model.transcribe(temp.name)
+     tesxt=" ".join(s.text for s in seg).strip()
+     os.remove(temp.name)
+     return {"text":tesxt}
+
+import pyttsx3
+engine = pyttsx3.init()
+def text_to_speech(text: str, out_path: str):
+    engine.save_to_file(text, out_path)
+    engine.runAndWait()
+
+@app.post("/voice_message")
+async def get_vioce_reply(m: reply):
+    decision=await router(m.message)
+
+    if decision == "rag":
+        y = await rag(m.message)  
+    else:
+        y = await get_chatbot_reply(m.session_id, m.message)
+    os.makedirs("replies", exist_ok=True)
+    audio_path = f"replies/{uuid.uuid4()}.mp3"
+    text_to_speech(y, audio_path)
+
+    return {"e": y, "audio_url": f"/replies/{os.path.basename(audio_path)}"}
+
+
+#--------------------end vioce feature
+
+
+#--------------------------file upload starts here
+file="rag_doc"
+os.makedirs(file,exist_ok=True)
+async def upl_file(f:UploadFile=File(...)):
+    if f.content_type!="application/pdf":
+        return {"error":" not a pdf"}
     
-    saved_embedding = np.array(user_record["face_embedding"], dtype=np.float32)
-    
-    # Process the incoming live login frame snapshotcd
-    contents = await file.read()
-    nparr = np.frombuffer(contents, np.uint8)
-    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR) #Now we have the new image.
-    
-    live_embedding = get_face_embedding(frame)
+    file_path=os.path.join(file,f.filename)
 
-    if live_embedding is None:
-          raise HTTPException(
-              status_code=400,
-              detail="Face tracking lost. Position your face in view."
-          )
+    with open(file_path,"wb") as buffer:
+         shutil.copyfileobj(f.file,buffer)
+    
+    await pre_rag(file_path)
+
+    return{f.filename:"mission complete sucess"}
+
+#-------pre rag
+async def pre_rag(f:str):
+     loadedpdf=PyPDFLoader(f)
+     doc=loadedpdf.load()
+     sp=RecursiveCharacterTextSplitter(chunk_size=500,chunk_overlap=100)
+     chunk=sp.split_documents(doc)
+     embedding=HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+     vector_db=FAISS.from_documents(documents=chunk,embedding=embedding)
+     vector_db.save_local("vector_db")
+     return 
+
      
     
-   
-        
-    
-    
-    # Run your verification logic function!
-    is_valid = verify_embedding(live_embedding, saved_embedding, threshold=0.60)
-    
-    if is_valid:
-        # Generate your chatbot JWT access token here
-        token = create_access_token(
-            {"sub": username}
-        )
-        return {"status": "authenticated", "token": token}
-    else:
-        raise HTTPException(status_code=401, detail="Authentication failed. Face biometric mismatch.")
-    
-app.include_router(router) #Take all the endpoints inside this router and add them to my main application
+@app.post("/upload")
+async def up(f:UploadFile=File(...)):
+     y=await upl_file(f)
+     return y
 
+
+
+
+#--------------------------file upload ends here
+
+@app.post("/auth/register")
+async def register(body: RegisterBody):
+    if users_collection.find_one({"username": body.username}):
+        return {"error": "Username already taken"}
+
+    users_collection.insert_one({
+        "username": body.username,
+        "password": body.password
+    })
+
+    return {
+        "status": "registered",
+        "username": body.username,
+        "success": True
+    }
+
+
+@app.post("/auth/login")
+async def login(body: LoginBody):
+    user = users_collection.find_one({"username": body.username})
+
+    if user is None:
+        return {"error": "Invalid username or password"}
+
+    if user["password"] != body.password:
+        return {"error": "Invalid username or password"}
+
+    return {
+        "status": "logged in",
+        "username": body.username,
+        "success": True
+    }
+
+@app.post("/auth/login-face")
+async def login_face(f: UploadFile = File(...)):
+    temp_path = os.path.join("face_uploads", f"{uuid.uuid4()}_{f.filename}")
+
+    with open(temp_path, "wb") as buffer:
+        shutil.copyfileobj(f.file, buffer)
+
+    try:
+        embedding = auth.get_face_embedding(temp_path)
+    except ValueError as e:
+        os.remove(temp_path)
+        return {"error": str(e)}
+
+    os.remove(temp_path)
+
+    username, score = auth.find_matching_user(embedding, users_collection)
+
+    if not username:
+        return {
+            "error": "No matching face found",
+            "best_score": score
+        }
+
+    return {
+        "status": "logged in",
+        "username": username,
+        "match_score": score,
+        "success": True
+    }
+
+@app.post("/auth/register-face")
+async def register_face(username: str, f: UploadFile = File(...)):
+    user = users_collection.find_one({"username": username})
+    if not user:
+        return {"error": "No account with that username. Register with a password first."}
+
+    os.makedirs("face_uploads", exist_ok=True)
+    temp_path = os.path.join("face_uploads", f"{uuid.uuid4()}_{f.filename}")
+
+    with open(temp_path, "wb") as buffer:
+        shutil.copyfileobj(f.file, buffer)
+
+    try:
+        embedding = auth.get_face_embedding(temp_path)
+    except ValueError as e:
+        os.remove(temp_path)
+        return {"error": str(e)}
+
+    os.remove(temp_path)
+
+    users_collection.update_one(
+        {"username": username},
+        {"$set": {"face_embedding": embedding}}
+    )
+
+    return {"status": "face registered", "username": username, "success": True}
